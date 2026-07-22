@@ -1,0 +1,315 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────
+// AG5 Observation Layer v15.2-C [ALLGOLD]
+// v15.1-C → v15.2-C:
+//   🚨 CRITICAL FIX: timeframe.isseconds → timeframe.in_seconds() > 0
+//      (isseconds = true เฉพาะ 1s-30s, ปิด integrity บน 1m/5m/H1/H4/D/W/M)
+//   ⚠️ V2 text: "~30 bars" → "1 HTF bar" (EMA seed จาก bar แรก, na แค่ [1] offset)
+//   Signal logic ไม่เปลี่ยนจาก v15.1-C
+// ─────────────────────────────────────────────────────────────────────────
+indicator("AG5 Observation Layer v15.2-C [ALLGOLD]", overlay=true, max_labels_count=500)
+
+// ── 1. OBSERVATION PARAMETERS ────────────────────────────────────────────
+string GRP1 = "AG5 OBSERVATION (No SMC Noise)"
+int   p_pivot_l    = input.int(5, "Pivot Left", minval=1, group=GRP1)
+int   p_pivot_r    = input.int(5, "Pivot Right", minval=1, group=GRP1)
+int   p_atr_period = input.int(30, "ATR Period (Tactical Volatility)", minval=1, group=GRP1)
+int   p_htf_ema_period = input.int(30, "HTF EMA Period (Slow Momentum)", minval=1, group=GRP1, tooltip="EMA บน HTF — ตั้ง 30-50 สำหรับ Daily, 10-20 สำหรับ Weekly")
+string p_htf       = input.timeframe("D", "Trend Baseline TF", group=GRP1, tooltip="ต้อง >= chart TF — ใช้ Daily/Weekly เท่านั้น")
+
+// ── 2. ALLGOLD CONSTRAINTS ──────────────────────────────────────────────
+string GRP2 = "IRREVERSIBLE CONSTRAINTS"
+string p_mode   = input.string("SATELLITE (Paper)", "Portfolio Mode", options=["CORE (Physical)", "SATELLITE (Paper)"], group=GRP2)
+float p_reward  = input.float(2.0, "Reward (TP Mult)", minval=0.1, group=GRP2)
+float p_risk    = input.float(1.0, "Risk (SL Mult)", minval=0.1, group=GRP2)
+float p_friction= input.float(15.0, "Friction Cost (price units)", minval=0.0, group=GRP2, tooltip="สเปรด+ค่าธรรมเนียม ALLGOLD ต่อรอบ")
+string p_policy = input.string("v1.0", "Policy Version ID", group=GRP2)
+string p_sess   = input.session("0715-0345", "Execution Window (Satellite Only)", group=GRP2, tooltip="ต้องตั้งเหมือนกันทุกชาร์ต/ไทม์เฟรม")
+float p_session_gap_floor_h = input.float(3.5, "Session-closed window (hours)", minval=0.5, group=GRP2, tooltip="ห้ามตั้ง 0 — จะปิด data integrity check")
+int p_cooldown_bars = input.int(10, "Min bars between same-dir signals", minval=0, group=GRP2)
+float p_gap_multiplier = input.float(1.5, "Data gap alarm multiplier", minval=0.1, group=GRP2)
+
+// ── 3. DATA INTEGRITY ───────────────────────────────────────────────────
+// 🚨 v15.2-C CRITICAL FIX:
+//   ❌ v15.1-C ใช้ timeframe.isseconds → true เฉพาะ 1s/5s/15s/30s
+//      → บน 1m/5m/15m/1H/4H/D/W/M: is_time_based = false
+//      → raw_gap_anomaly = false เสมอ → integrity_ok = true เสมอ
+//      → DATA INTEGRITY CHECK ตายเงียบ (regression จาก v14.9-C)
+//   ✅ แก้เป็น timeframe.in_seconds() > 0
+//      → time-based charts (1m=60, 5m=300, H4=14400, D=86400): > 0 = true
+//      → Renko/Tick/Range: in_seconds() = 0 → false (skip check, ตั้งใจ)
+bool is_time_based = timeframe.in_seconds() > 0
+
+int expected_gap = timeframe.in_seconds() * 1000
+int actual_gap   = time - time[1]
+bool is_new_day  = dayofmonth(time) != dayofmonth(time[1]) or month(time) != month(time[1]) or year(time) != year(time[1])
+bool plausible_session_gap = actual_gap >= (p_session_gap_floor_h * 60 * 60 * 1000)
+bool raw_gap_anomaly = is_time_based and actual_gap > expected_gap * p_gap_multiplier
+bool was_exempted = raw_gap_anomaly and (is_new_day or plausible_session_gap)
+bool is_degraded = raw_gap_anomaly and not is_new_day and not plausible_session_gap
+bool integrity_ok = not is_degraded
+
+// ── 4. OBSERVATION LAYER ────────────────────────────────────────────────
+// (V1) HTF ต้อง >= chart TF
+bool htf_valid = timeframe.in_seconds(p_htf) >= timeframe.in_seconds()
+
+float htf_close = request.security(syminfo.tickerid, p_htf, close[1], lookahead=barmerge.lookahead_on)
+float htf_ema   = request.security(syminfo.tickerid, p_htf, ta.ema(close, p_htf_ema_period)[1], lookahead=barmerge.lookahead_on)
+bool  trend_up  = htf_close > htf_ema
+
+// (V2) HTF warm-up: na แค่ 1 HTF bar แรก ([1] offset บน bar แรก = na)
+//      ไม่ใช่ 30 bars — EMA seed จาก close[0] ทันที
+bool htf_warming = na(htf_ema)
+
+float pivot_h = ta.pivothigh(high, p_pivot_l, p_pivot_r)
+float pivot_l = ta.pivotlow(low, p_pivot_l, p_pivot_r)
+bool is_pivot_high = not na(pivot_h)
+bool is_pivot_low  = not na(pivot_l)
+
+float atr_val = ta.atr(p_atr_period)
+
+// ── 5. FRICTION & NET EDGE ──────────────────────────────────────────────
+float gross_tp = atr_val * p_reward
+float net_edge = gross_tp - p_friction
+bool edge_valid = net_edge > 0
+
+// ── 6. SESSION GATE ─────────────────────────────────────────────────────
+bool in_session = not na(time(timeframe.period, p_sess, "Asia/Bangkok"))
+bool session_gate = p_mode == "CORE (Physical)" ? true : in_session
+
+// ── 7. POLICY ENGINE ────────────────────────────────────────────────────
+bool raw_sell = is_pivot_high and not trend_up
+bool raw_buy  = is_pivot_low  and trend_up
+
+var int last_buy_bar  = -999999
+var int last_sell_bar = -999999
+bool buy_cooldown_ok  = (bar_index - last_buy_bar)  >= p_cooldown_bars
+bool sell_cooldown_ok = (bar_index - last_sell_bar) >= p_cooldown_bars
+
+bool rej_trend_s = is_pivot_high and trend_up
+bool rej_trend_b = is_pivot_low and not trend_up
+bool rej_friction = (raw_sell or raw_buy) and not edge_valid
+bool rej_integrity = (raw_sell or raw_buy) and not integrity_ok
+bool rej_session = (raw_sell or raw_buy) and edge_valid and integrity_ok and not session_gate
+bool rej_cooldown_s = raw_sell and edge_valid and integrity_ok and session_gate and not sell_cooldown_ok
+bool rej_cooldown_b = raw_buy  and edge_valid and integrity_ok and session_gate and not buy_cooldown_ok
+
+// (V1) htf_valid gate — block signal ถ้า HTF < chart TF
+bool valid_sell = raw_sell and edge_valid and integrity_ok and session_gate and sell_cooldown_ok and htf_valid
+bool valid_buy  = raw_buy  and edge_valid and integrity_ok and session_gate and buy_cooldown_ok and htf_valid
+
+if valid_buy
+    last_buy_bar := bar_index
+if valid_sell
+    last_sell_bar := bar_index
+
+string sell_label = p_mode == "CORE (Physical)" ? "REDUCE/EXIT" : "SELL"
+
+// ── 7.5 OUTCOME TRACKING ────────────────────────────────────────────────
+// Known limitation: single-pending per direction (documented, by design)
+var float buy_stop    = na
+var float buy_target  = na
+var bool  buy_pending  = false
+
+var float sell_stop   = na
+var float sell_target = na
+var bool  sell_pending = false
+
+var int win_count_buy   = 0
+var int loss_count_buy  = 0
+var int win_count_sell  = 0
+var int loss_count_sell = 0
+
+if buy_pending
+    if low <= buy_stop
+        loss_count_buy += 1
+        buy_pending := false
+    else if high >= buy_target
+        win_count_buy += 1
+        buy_pending := false
+
+if sell_pending
+    if high >= sell_stop
+        loss_count_sell += 1
+        sell_pending := false
+    else if low <= sell_target
+        win_count_sell += 1
+        sell_pending := false
+
+if valid_buy
+    buy_stop    := close - atr_val * p_risk
+    buy_target  := close + atr_val * p_reward
+    buy_pending := true
+
+if valid_sell
+    sell_stop    := close + atr_val * p_risk
+    sell_target  := close - atr_val * p_reward
+    sell_pending := true
+
+int total_buy   = win_count_buy + loss_count_buy
+int total_sell  = win_count_sell + loss_count_sell
+float win_rate_buy  = total_buy  > 0 ? win_count_buy  * 100.0 / total_buy  : na
+float win_rate_sell = total_sell > 0 ? win_count_sell * 100.0 / total_sell : na
+
+// ── 8. VISUAL LOGGER ────────────────────────────────────────────────────
+plot(htf_ema, "Trend Baseline (HTF)", color=trend_up ? color.new(color.green, 30) : color.new(color.red, 30), linewidth=2)
+
+if valid_sell
+    label.new(bar_index[p_pivot_r], high[p_pivot_r], sell_label + "\nNet: " + str.tostring(net_edge, "#.##"), color=color.rgb(200, 0, 0), textcolor=color.white, style=label.style_label_down, size=size.small)
+if valid_buy
+    label.new(bar_index[p_pivot_r], low[p_pivot_r], "BUY\nNet: " + str.tostring(net_edge, "#.##"), color=color.rgb(0, 150, 0), textcolor=color.white, style=label.style_label_up, size=size.small)
+
+if rej_trend_s
+    label.new(bar_index[p_pivot_r], high[p_pivot_r], "✖ TREND", color=color.new(color.gray, 80), textcolor=color.gray, style=label.style_label_down, size=size.tiny)
+if rej_trend_b
+    label.new(bar_index[p_pivot_r], low[p_pivot_r], "✖ TREND", color=color.new(color.gray, 80), textcolor=color.gray, style=label.style_label_up, size=size.tiny)
+if rej_friction and raw_sell
+    label.new(bar_index[p_pivot_r], high[p_pivot_r], "✖ FRICTION", color=color.new(color.orange, 60), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+if rej_friction and raw_buy
+    label.new(bar_index[p_pivot_r], low[p_pivot_r], "✖ FRICTION", color=color.new(color.orange, 60), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+if rej_integrity and raw_sell
+    label.new(bar_index[p_pivot_r], high[p_pivot_r], "✖ DATA", color=color.new(color.purple, 60), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+if rej_integrity and raw_buy
+    label.new(bar_index[p_pivot_r], low[p_pivot_r], "✖ DATA", color=color.new(color.purple, 60), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+if rej_cooldown_s
+    label.new(bar_index[p_pivot_r], high[p_pivot_r], "✖ COOLDOWN", color=color.new(color.blue, 60), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+if rej_cooldown_b
+    label.new(bar_index[p_pivot_r], low[p_pivot_r], "✖ COOLDOWN", color=color.new(color.blue, 60), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+if rej_session and raw_sell
+    label.new(bar_index[p_pivot_r], high[p_pivot_r], "✖ SESSION", color=color.new(color.navy, 60), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+if rej_session and raw_buy
+    label.new(bar_index[p_pivot_r], low[p_pivot_r], "✖ SESSION", color=color.new(color.navy, 60), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+// ── 9. DASHBOARD (4 cols × 13 rows) ─────────────────────────────────────
+var table dash = table.new(position.top_right, 4, 13, bgcolor=color.rgb(15, 15, 15, 5), border_color=color.rgb(60, 60, 60), border_width=1)
+
+var int rej_count_trend = 0
+var int rej_count_friction = 0
+var int rej_count_integrity = 0
+var int rej_count_cooldown_b = 0
+var int rej_count_cooldown_s = 0
+var int rej_count_session = 0
+var int exempted_gap_count = 0
+
+if rej_trend_s or rej_trend_b
+    rej_count_trend += 1
+if rej_friction
+    rej_count_friction += 1
+if rej_integrity
+    rej_count_integrity += 1
+if rej_cooldown_b
+    rej_count_cooldown_b += 1
+if rej_cooldown_s
+    rej_count_cooldown_s += 1
+if rej_session
+    rej_count_session += 1
+if was_exempted
+    exempted_gap_count += 1
+
+if barstate.islast
+    table.cell(dash, 0, 0, "ALLGOLD AG5 v15.2-C", bgcolor=color.rgb(20, 20, 200), text_color=color.white, text_font_family=font.family_monospace, text_halign=text.align_center)
+    table.merge_cells(dash, 0, 0, 3, 0)
+
+    table.cell(dash, 0, 1, "Policy ID", bgcolor=color.rgb(40, 40, 40), text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 1, p_policy, text_color=color.yellow, text_size=size.small)
+    table.cell(dash, 2, 1, "Friction", bgcolor=color.rgb(40, 40, 40), text_color=color.gray, text_size=size.small)
+    table.cell(dash, 3, 1, str.tostring(p_friction, "#.#"), text_color=color.orange, text_size=size.small)
+
+    table.cell(dash, 0, 2, "Trend (" + p_htf + ")", bgcolor=color.rgb(40, 40, 40), text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 2, trend_up ? "BULL" : "BEAR", bgcolor=trend_up ? color.rgb(0, 120, 0) : color.rgb(150, 0, 0), text_color=color.white, text_size=size.small)
+    table.cell(dash, 2, 2, "Net Edge", bgcolor=color.rgb(40, 40, 40), text_color=color.gray, text_size=size.small)
+    table.cell(dash, 3, 2, str.tostring(net_edge, "#.##"), text_color=edge_valid ? color.green : color.red, text_size=size.small)
+
+    table.cell(dash, 0, 3, "Risk (SL)", bgcolor=color.rgb(40, 40, 40), text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(p_risk, "#.#") + " R", text_color=color.red, text_size=size.small)
+    table.cell(dash, 2, 3, "Reward (TP)", bgcolor=color.rgb(40, 40, 40), text_color=color.gray, text_size=size.small)
+    table.cell(dash, 3, 3, str.tostring(p_reward, "#.#") + " R", text_color=color.green, text_size=size.small)
+
+    table.cell(dash, 0, 4, "Mode", bgcolor=color.rgb(40, 40, 40), text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 4, p_mode == "CORE (Physical)" ? "CORE" : "SAT", bgcolor=p_mode == "CORE (Physical)" ? color.rgb(100, 50, 0) : color.rgb(0, 100, 150), text_color=color.white, text_size=size.small)
+    table.cell(dash, 2, 4, "Window", bgcolor=color.rgb(40, 40, 40), text_color=color.gray, text_size=size.small)
+    table.cell(dash, 3, 4, session_gate ? "ACTIVE" : "CLOSED", bgcolor=session_gate ? color.rgb(0, 150, 0) : color.rgb(80, 80, 80), text_color=color.white, text_size=size.small)
+
+    table.cell(dash, 0, 5, "SYS STATUS", bgcolor=color.rgb(100, 80, 0), text_color=color.white, text_size=size.normal)
+    string sys_status = "SCANNING..."
+    color  sys_color  = color.blue
+
+    if not htf_valid
+        sys_status := "⚠ HTF < CHART TF"
+        sys_color  := color.rgb(200, 0, 0)
+    else if htf_warming
+        sys_status := "HTF INIT (1 bar)"
+        sys_color  := color.rgb(150, 150, 0)
+    else if not integrity_ok
+        sys_status := "INTEGRITY FAIL"
+        sys_color  := color.purple
+    else if not edge_valid and (raw_sell or raw_buy)
+        sys_status := "FRICTION BLOCK"
+        sys_color  := color.orange
+    else if not session_gate and (raw_sell or raw_buy)
+        sys_status := "WINDOW CLOSED"
+        sys_color  := color.gray
+    else if rej_cooldown_s or rej_cooldown_b
+        sys_status := "COOLDOWN"
+        sys_color  := color.blue
+    else if valid_sell
+        sys_status := sell_label + " EXECUTED"
+        sys_color  := color.red
+    else if valid_buy
+        sys_status := "BUY EXECUTED"
+        sys_color  := color.green
+    else if rej_trend_s or rej_trend_b
+        sys_status := "TREND FILTER"
+        sys_color  := color.rgb(150, 100, 0)
+
+    table.cell(dash, 1, 5, sys_status, bgcolor=sys_color, text_color=color.white, text_font_family=font.family_monospace, text_size=size.normal)
+    table.merge_cells(dash, 1, 5, 3, 5)
+
+    table.cell(dash, 0, 6, "REJECTIONS", bgcolor=color.rgb(60, 20, 20), text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 6, "Trend: " + str.tostring(rej_count_trend), text_color=color.gray, text_size=size.small)
+    table.cell(dash, 2, 6, "Friction: " + str.tostring(rej_count_friction), text_color=color.orange, text_size=size.small)
+    table.cell(dash, 3, 6, "Data: " + str.tostring(rej_count_integrity), text_color=color.purple, text_size=size.small)
+
+    table.cell(dash, 0, 7, "SESSION", bgcolor=color.rgb(30, 30, 50), text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 7, "Rejects: " + str.tostring(rej_count_session), text_color=color.new(color.navy, 0), text_size=size.small)
+    table.merge_cells(dash, 1, 7, 3, 7)
+
+    table.cell(dash, 0, 8, "REALITY", bgcolor=color.rgb(20, 60, 20), text_color=color.white, text_size=size.small)
+    string reality_status = integrity_ok ? "ASSUMPTIONS VALID" : "DRIFT DETECTED"
+    color reality_color = integrity_ok ? color.rgb(0, 100, 0) : color.rgb(150, 0, 0)
+    table.cell(dash, 1, 8, reality_status, bgcolor=reality_color, text_color=color.white, text_size=size.small)
+    table.merge_cells(dash, 1, 8, 3, 8)
+
+    table.cell(dash, 0, 9, "COOLDOWN", bgcolor=color.rgb(20, 20, 60), text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 9, "Buy: " + str.tostring(rej_count_cooldown_b), text_color=color.gray, text_size=size.small)
+    table.cell(dash, 2, 9, "Sell: " + str.tostring(rej_count_cooldown_s), text_color=color.gray, text_size=size.small)
+    table.cell(dash, 3, 9, str.tostring(p_cooldown_bars) + " bars", text_color=color.yellow, text_size=size.small)
+
+    table.cell(dash, 0, 10, "GAPS EXEMPTED", bgcolor=color.rgb(40, 30, 10), text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 10, str.tostring(exempted_gap_count), text_color=color.yellow, text_size=size.small)
+    table.merge_cells(dash, 1, 10, 3, 10)
+
+    table.cell(dash, 0, 11, "OUTCOME", bgcolor=color.rgb(20, 40, 40), text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 11, "Buy " + str.tostring(win_count_buy) + "-" + str.tostring(loss_count_buy) + (na(win_rate_buy) ? "" : " (" + str.tostring(win_rate_buy, "#.#") + "%)"), text_color=color.green, text_size=size.small)
+    table.cell(dash, 2, 11, "Sell " + str.tostring(win_count_sell) + "-" + str.tostring(loss_count_sell) + (na(win_rate_sell) ? "" : " (" + str.tostring(win_rate_sell, "#.#") + "%)"), text_color=color.red, text_size=size.small)
+    table.cell(dash, 3, 11, "", text_color=color.gray, text_size=size.small)
+
+    // [ROW 12] Config Warnings (V2 text แก้แล้ว)
+    string cfg_warn = ""
+    color  cfg_color = color.rgb(0, 80, 0)
+    if not htf_valid
+        cfg_warn := "⚠ HTF (" + p_htf + ") < Chart TF — SIGNALS BLOCKED"
+        cfg_color := color.rgb(200, 0, 0)
+    else if htf_warming
+        cfg_warn := "⏳ HTF initializing (1 " + p_htf + " bar)"
+        cfg_color := color.rgb(150, 150, 0)
+    else if not is_time_based
+        cfg_warn := "⚠ Non-time chart — integrity check disabled"
+        cfg_color := color.rgb(150, 100, 0)
+    else
+        cfg_warn := "✓ Configuration OK"
+        cfg_color := color.rgb(0, 80, 0)
+
+    table.cell(dash, 0, 12, "CONFIG", bgcolor=color.rgb(30, 30, 30), text_color=color.gray, text_size=size.small)
+    table.cell(dash, 1, 12, cfg_warn, bgcolor=cfg_color, text_color=color.white, text_size=size.small)
+    table.merge_cells(dash, 1, 12, 3, 12)
