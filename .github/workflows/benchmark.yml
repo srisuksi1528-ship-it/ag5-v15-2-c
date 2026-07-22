@@ -1,8 +1,15 @@
 name: AG5 Benchmark
-on: [push, pull_request]
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
 jobs:
   backtest:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -11,3 +18,10 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python backtest_ag5.py
       - run: cat RESULTS_AG5.md
+      - name: Auto commit RESULTS
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "ag5-bot"
+          git config user.email "bot@ag5.local"
+          git add RESULTS_AG5.md
+          git diff --staged --quiet && echo "No change" || (git commit -m "Update RESULTS_AG5.md [skip ci]" && git push)
